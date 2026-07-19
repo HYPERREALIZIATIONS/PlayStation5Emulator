@@ -74,6 +74,8 @@ namespace Prospero.Emu.Kernel
 
         public static bool TryResolve(ulong nid, out string name) =>
             _map.TryGetValue(nid & 0xFFFFFFFF, out name!);
+
+        public static IEnumerable<ulong> All => _map.Keys;
     }
 
     /// <summary>

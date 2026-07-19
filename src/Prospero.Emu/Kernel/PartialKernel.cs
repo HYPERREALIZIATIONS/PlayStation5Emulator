@@ -30,6 +30,7 @@ namespace Prospero.Emu.Kernel
         private ulong _nextHandle = 0x1000;
         private ulong _scratchHeap = 0x7000_0000_0000; // a high guest region for synthetic buffers
         private readonly Dictionary<ulong, string> _syscallNames = new();
+        private readonly HashSet<ulong> _knownNids = new();
 
         public PartialKernel(Logger log, GuestMemory mem, HackedFileSystem fs, Graphics.Agc agc)
         {
@@ -37,7 +38,15 @@ namespace Prospero.Emu.Kernel
             _mem = mem;
             _fs = fs;
             _agc = agc;
+            foreach (var k in KnownNids.All) _knownNids.Add(k);
             InitSyscallNames();
+        }
+
+        /// <summary>Registers the NIDs a loaded module imports so that calls routed
+        /// through the synthetic trampolines are recognised as libkernel calls.</summary>
+        public void RegisterNids(IEnumerable<ulong> nids)
+        {
+            foreach (var n in nids) _knownNids.Add(n & 0xFFFFFFFF);
         }
 
         private void InitSyscallNames()
@@ -75,10 +84,78 @@ namespace Prospero.Emu.Kernel
             ulong a6 = cpu.Regs.Gp[9];  // R9
 
             string name = _syscallNames.TryGetValue(id, out var n) ? n : $"syscall_0x{id:X}";
-            _log.Trace("syscall", $"#{id} {name} args=({a1:X}, {a2:X}, {a3:X}, {a4:X}, {a5:X}, {a6:X})");
 
+            // A NID in RAX means the call came from a synthetic libkernel
+            // trampoline (mov rax, nid; syscall). Route it to the libkernel layer.
+            if (_knownNids.Contains(id))
+            {
+                name = KnownNids.Resolve(id);
+                _log.Trace("libkernel", $"NID 0x{id:X8} {name} args=({a1:X}, {a2:X}, {a3:X}, {a4:X}, {a5:X}, {a6:X})");
+                cpu.Regs.Gp[0] = HandleLibkernel(id, cpu, a1, a2, a3, a4, a5, a6);
+                return;
+            }
+
+            _log.Trace("syscall", $"#{id} {name} args=({a1:X}, {a2:X}, {a3:X}, {a4:X}, {a5:X}, {a6:X})");
             ulong result = Dispatch(id, name, cpu, a1, a2, a3, a4, a5, a6);
             cpu.Regs.Gp[0] = result;
+        }
+
+        /// <summary>Resolves an imported libkernel function (by NID) to benign
+        /// research behavior. Returns 0 / success or a synthetic handle.</summary>
+        private ulong HandleLibkernel(ulong nid, CpuCore cpu, ulong a1, ulong a2, ulong a3, ulong a4, ulong a5, ulong a6)
+        {
+            switch (nid & 0xFFFFFFFF)
+            {
+                case 0x0DEB17A8: // sceKernelExitProcess
+                case 0xCD3C83E0: // sceKernelExit
+                    throw new SyscallExit((int)a1);
+                case 0xEF092AAC: // sceKernelGetProcParam
+                    return AllocScratch(0x100);
+                case 0x7D37B4E8: // sceKernelAllocateDirectMemory
+                    {
+                        ulong pout = a6;
+                        ulong baseAddr = AllocScratch(a3);
+                        if (pout != 0) _mem.WriteU64(pout, baseAddr);
+                        return 0;
+                    }
+                case 0xA186B7E0: // sceKernelMapDirectMemory
+                    return a1;
+                case 0x2C69DD61: // sceKernelAllocateMemoryBlock
+                    {
+                        ulong pbase = a5;
+                        ulong baseAddr = AllocScratch(a3);
+                        if (pbase != 0) _mem.WriteU64(pbase, baseAddr);
+                        return 0;
+                    }
+                case 0xAFBB2A3E: // sceKernelGetMemoryBlockBase
+                    { _mem.WriteU64(a2, AllocScratch(0x1000)); return 0; }
+                case 0x35DAE69E: // sceKernelUsleep
+                    return 0;
+                case 0x689C8FF3: // sceKernelGetThreadId
+                case 0x4C9A9E8C: // sceKernelGetCurrentThread
+                    return 1;
+                case 0x7FE4B4C8: // sceVideoOutOpen
+                    return _agc.VideoOutOpen(cpu, a1, a2, a3, a4);
+                case 0xCD3286AB: // sceVideoOutRegisterBuffers
+                    return _agc.VideoOutRegisterBuffers(cpu, a1, a2, a3, a4, a5, a6);
+                case 0xCB3C7E4C: // sceVideoOutSubmitFlip
+                    return _agc.VideoOutSubmitFlip(cpu, a1, a2, a3, a4);
+                case 0x5C1C0A93: // sceGnmGetAGCInterface
+                    return _agc.GetAgcInterface(cpu, a1);
+                case 0xBA9C4B1B: // sceGnmSubmitCommandBuffers
+                    return _agc.SubmitCommandBuffers(cpu, (int)a1, a2);
+                case 0x8F6FC354: // sceGnmCreateGpuMemory
+                case 0xAD2D4BA0: // sceGnmDestroyGpuMemory
+                case 0x9E7C7C0B: // sceGnmInitDefaultGpuMemory
+                    return NewHandle();
+                case 0x5C0D8A37: // sceSysmoduleLoadModule
+                case 0x4FC36FCE: // sceSysmoduleUnloadModule
+                case 0x42F6E558: // sceSysmoduleIsLoaded
+                    return 0;
+                default:
+                    _log.Debug("libkernel", $"Unhandled NID 0x{nid & 0xFFFFFFFF:X8} ({KnownNids.Resolve(nid)}) -> 0");
+                    return 0;
+            }
         }
 
         private ulong Dispatch(ulong id, string name, CpuCore cpu, ulong a1, ulong a2, ulong a3, ulong a4, ulong a5, ulong a6)

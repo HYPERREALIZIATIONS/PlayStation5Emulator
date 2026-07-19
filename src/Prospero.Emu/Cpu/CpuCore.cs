@@ -1,4 +1,5 @@
 using System;
+using System.Numerics;
 using Prospero.Emu.Core;
 
 namespace Prospero.Emu.Cpu
@@ -20,8 +21,11 @@ namespace Prospero.Emu.Cpu
         private readonly GuestMemory _mem;
         private readonly IKernel _kernel;
         private readonly Decoder _dec = new();
+        private readonly CpuExtensions _ext;
 
         public Registers Regs { get; } = new();
+        public GuestMemory Mem => _mem;
+        public CpuExtensions Ext => _ext;
 
         public ulong InstructionsExecuted;
         public ulong SyscallCount;
@@ -38,6 +42,7 @@ namespace Prospero.Emu.Cpu
             _log = log;
             _mem = mem;
             _kernel = kernel;
+            _ext = new CpuExtensions(_dec, this);
         }
 
         public void Reset(ulong entry, ulong stackTop)
@@ -296,18 +301,47 @@ namespace Prospero.Emu.Cpu
                     }
                     break;
 
+                case 0xC0: case 0xC1: // group 2: shift r/m, imm8
+                case 0xD0: case 0xD1: case 0xD2: case 0xD3: // group 2: shift r/m, 1 / cl
+                    ShiftGroup(op, opSize, startRip);
+                    break;
+
+                case 0xF6: case 0xF7: // group 3: test/div/mul/not/neg
+                    Group3(op, opSize, startRip);
+                    break;
+
                 case 0x0F:
                     TwoByteOp(startRip);
                     break;
 
                 default:
-                    throw new CpuFault($"unsupported opcode 0x{op:X2} at 0x{startRip:X}");
+                    if (!TrySkipUnknown(startRip, op, "cpu"))
+                        throw new CpuFault($"unsupported opcode 0x{op:X2} at 0x{startRip:X}");
+                    break;
             }
 
             if (TraceInstructions && InstructionsExecuted < 200)
             {
                 _log.Trace("cpu", $"rip=0x{startRip:X} op=0x{op:X2} -> rip=0x{Regs.Rip:X} rax=0x{Regs.Gp[0]:X}");
             }
+        }
+
+        /// <summary>
+        /// Best-effort skip of an unsupported instruction so a research run can
+        /// continue instead of faulting. Returns false if we cannot determine the
+        /// length safely (caller should then fault).
+        /// </summary>
+        private bool TrySkipUnknown(ulong startRip, byte op, string cat)
+        {
+            // Re-point the decoder at the instruction start.
+            var buf = new byte[15];
+            for (int i = 0; i < 15; i++) buf[i] = _mem.ReadU8(startRip + (ulong)i);
+            _dec.Code = buf; _dec.Pc = 0; _dec.DecodePrefixes();
+            int len = _ext.TryLengthAfterPrefixes(op);
+            if (len <= 0 || len > 15) return false;
+            _log.Debug(cat, $"skipping unsupported insn 0x{op:X2} @ 0x{startRip:X} (len {len})");
+            Regs.Rip = startRip + (ulong)len;
+            return true;
         }
 
         private void TwoByteOp(ulong startRip)
@@ -334,6 +368,23 @@ namespace Prospero.Emu.Cpu
                             Regs.Rip = startRip + (ulong)_dec.Pc;
                     }
                     break;
+                case 0x10: case 0x11: case 0x12: case 0x13:
+                case 0x14: case 0x15: case 0x16: case 0x17:
+                case 0x18: case 0x19: // MOVUPS/MOVAPS/MOVSS/MOVSD and arithmetic PS
+                case 0x28: case 0x29: case 0x2A: case 0x2B:
+                case 0x2C: case 0x2D: case 0x2E: case 0x2F:
+                case 0x54: case 0x55: case 0x56: case 0x57:
+                case 0x58: case 0x59: case 0x5A: case 0x5B:
+                case 0x5C: case 0x5D: case 0x5E: case 0x5F:
+                case 0x6E: case 0x6F: case 0x7E: case 0xEF:
+                    SseOp(op, startRip);
+                    break;
+                case 0xB6: case 0xB7: // MOVZX r, r/m (8/16 bit source)
+                    MovzxMovsx(op, opSize, op == 0xB6 ? 1 : 2, startRip, signExtend: false);
+                    break;
+                case 0xBE: case 0xBF: // MOVSX r, r/m (8/16 bit source)
+                    MovzxMovsx(op, opSize, op == 0xBE ? 1 : 2, startRip, signExtend: true);
+                    break;
                 case 0x1F: // NOP (multi-byte, r/m)
                     {
                         var mr = _dec.ReadModRm();
@@ -341,24 +392,10 @@ namespace Prospero.Emu.Cpu
                         Regs.Rip = startRip + (ulong)_dec.Pc;
                     }
                     break;
-                case 0xAF: // (REP) LODS/SCAS/CMPS prefixes handled elsewhere; treat as NOP for now
-                    {
-                        var mr = _dec.ReadModRm();
-                        if (mr.Mod != 3) _dec.EffectiveAddress(mr, Reg, startRip);
-                        Regs.Rip = startRip + (ulong)_dec.Pc;
-                    }
-                    break;
-                case 0x10: case 0x11: case 0x12: case 0x13:
-                case 0x14: case 0x15: case 0x16: case 0x17:
-                case 0x18: case 0x19: // various SSE/MOVUPS etc. - stub as NOP with operand decode
-                    {
-                        var mr = _dec.ReadModRm();
-                        if (mr.Mod != 3) _dec.EffectiveAddress(mr, Reg, startRip);
-                        Regs.Rip = startRip + (ulong)_dec.Pc;
-                    }
-                    break;
                 default:
-                    throw new CpuFault($"unsupported 0F opcode 0x{op:X2} at 0x{startRip:X}");
+                    if (!TrySkipUnknown(startRip, 0x0F, "cpu"))
+                        throw new CpuFault($"unsupported 0F opcode 0x{op:X2} at 0x{startRip:X}");
+                    break;
             }
         }
 
@@ -633,6 +670,301 @@ namespace Prospero.Emu.Cpu
                 ulong addr = _dec.EffectiveAddress(mr, Reg, startRip);
                 ulong v = is8 ? _dec.ReadByte() : ReadMovImm();
                 WriteGuest(addr, Mask(v, size), size);
+            }
+            Regs.Rip = startRip + (ulong)_dec.Pc;
+        }
+
+        // ---- group 2: shifts / rotates (0xC0/0xC1 imm8, 0xD0-0xD3 1/cl) ----
+        private void ShiftGroup(byte op, int opSize, ulong startRip)
+        {
+            var mr = _dec.ReadModRm();
+            int sub = mr.Reg;
+            uint count;
+            if (op == 0xC0 || op == 0xC1) count = _dec.ReadByte();
+            else if (op == 0xD1 || op == 0xD3) count = 1;
+            else count = (uint)Regs.Gp[1] & 0x3F; // CL (RCX)
+
+            ulong Apply(ulong v)
+            {
+                v = Mask(v, opSize);
+                int bits = opSize * 8;
+                switch (sub)
+                {
+                    case 0: case 1: // ROL / ROR (we implement as logical shift; RCL/RCR approximated)
+                        {
+                            uint c = count & (uint)(bits - 1);
+                            if (c == 0) break;
+                            if (sub == 0) v = (v << (int)c) | (v >> (bits - (int)c));
+                            else v = (v >> (int)c) | (v << (bits - (int)c));
+                            v = Mask(v, opSize);
+                        }
+                        break;
+                    case 4: case 5: // SHL / SHR
+                        {
+                            uint c = count & 0x3F;
+                            if (sub == 4) { bool cf = ((v >> (bits - (int)c)) & 1) != 0; v = Mask(v << (int)c, opSize); Regs.SetCf(cf); }
+                            else { bool cf = ((v >> ((int)c - 1)) & 1) != 0; v = Mask(v >> (int)c, opSize); Regs.SetCf(cf); }
+                        }
+                        break;
+                    case 6: case 7: // SAL (=SHL) / SAR
+                        {
+                            uint c = count & 0x3F;
+                            if (sub == 7)
+                            {
+                                ulong sign = (v & (1UL << (bits - 1)));
+                                long sv = (long)Mask(v, opSize);
+                                sv >>= (int)c;
+                                v = Mask((ulong)sv, opSize);
+                            }
+                            else { v = Mask(v << (int)c, opSize); }
+                            v = Mask(v, opSize);
+                        }
+                        break;
+                    default:
+                        break;
+                }
+                Regs.SetZfSf(v, opSize * 8);
+                return v;
+            }
+
+            if (mr.Mod == 3)
+            {
+                int r = mr.Rm | (_dec.RexBase != 0 ? 8 : 0);
+                SetReg(r, Apply(Reg(r)));
+            }
+            else
+            {
+                ulong addr = _dec.EffectiveAddress(mr, Reg, startRip);
+                WriteGuest(addr, Apply(ReadGuest(addr, opSize)), opSize);
+            }
+            Regs.Rip = startRip + (ulong)_dec.Pc;
+        }
+
+        // ---- group 3: 0xF6/0xF7 (TEST imm, NOT, NEG, MUL, IMUL, DIV, IDIV) ----
+        private void Group3(byte op, int opSize, ulong startRip)
+        {
+            var mr = _dec.ReadModRm();
+            int sub = mr.Reg;
+            if (mr.Mod == 3)
+            {
+                int r = mr.Rm | (_dec.RexBase != 0 ? 8 : 0);
+                ulong v = Reg(r);
+                switch (sub)
+                {
+                    case 0: case 1: // TEST r/m, imm
+                        {
+                            ulong imm = op == 0xF7 && _dec.RexW ? _dec.ReadU64() : (op == 0xF7 ? _dec.ReadU32() : _dec.ReadByte());
+                            Test(v, imm, op == 0xF6 ? 1 : opSize);
+                        }
+                        break;
+                    case 2: case 3: // NOT
+                        SetReg(r, Mask(~v, opSize));
+                        break;
+                    case 4: case 5: // NEG
+                        SetReg(r, Sub(0, v, opSize));
+                        break;
+                    case 6: // MUL (unsigned) AX/DX:AX/EDX:EAX/RAX:RDX
+                        MulDiv(v, opSize, signed: false);
+                        break;
+                    case 7: // IMUL (signed)
+                        MulDiv(v, opSize, signed: true);
+                        break;
+                    default:
+                        throw new CpuFault($"group3 sub {sub}");
+                }
+            }
+            else
+            {
+                ulong addr = _dec.EffectiveAddress(mr, Reg, startRip);
+                switch (sub)
+                {
+                    case 0: case 1:
+                        {
+                            ulong imm = op == 0xF7 && _dec.RexW ? _dec.ReadU64() : (op == 0xF7 ? _dec.ReadU32() : _dec.ReadByte());
+                            Test(ReadGuest(addr, op == 0xF6 ? 1 : opSize), imm, op == 0xF6 ? 1 : opSize);
+                        }
+                        break;
+                    case 2: case 3:
+                        WriteGuest(addr, Mask(~ReadGuest(addr, opSize), opSize), opSize);
+                        break;
+                    case 4: case 5:
+                        WriteGuest(addr, Sub(0, ReadGuest(addr, opSize), opSize), opSize);
+                        break;
+                    case 6: case 7:
+                        MulDiv(ReadGuest(addr, opSize), opSize, signed: sub == 7);
+                        break;
+                    default:
+                        throw new CpuFault($"group3 sub {sub}");
+                }
+            }
+            Regs.Rip = startRip + (ulong)_dec.Pc;
+        }
+
+        private void MulDiv(ulong operand, int opSize, bool signed)
+        {
+            // Single-operand MUL/IMUL: RAX * operand -> RDX:RAX (full width).
+            if (opSize == 8)
+            {
+                if (signed)
+                {
+                    Int128 a = (Int128)(long)Regs.Gp[0];
+                    Int128 b = (Int128)(long)operand;
+                    Int128 r = a * b;
+                    Regs.Gp[0] = unchecked((ulong)(long)r);          // low 64 bits
+                    Regs.Gp[2] = unchecked((ulong)(long)(r >> 64));  // high 64 bits
+                }
+                else
+                {
+                    UInt128 a = (UInt128)Regs.Gp[0];
+                    UInt128 b = (UInt128)operand;
+                    UInt128 r = a * b;
+                    Regs.Gp[0] = unchecked((ulong)r);            // low 64 bits
+                    Regs.Gp[2] = unchecked((ulong)(r >> 64));    // high 64 bits
+                }
+            }
+            else
+            {
+                uint a = (uint)Mask(Regs.Gp[0], 4);
+                uint b = (uint)Mask(operand, 4);
+                ulong r = (ulong)a * b;
+                Regs.Gp[0] = Mask(r, 4);
+                Regs.Gp[2] = Mask(r >> 32, 4);
+            }
+        }
+
+        // ---- MOVZX / MOVSX (0x0F 0xB6/0xB7/0xBE/0xBF) ----
+        private void MovzxMovsx(byte op, int opSizeDst, int opSizeSrc, ulong startRip, bool signExtend)
+        {
+            var mr = _dec.ReadModRm();
+            int regIdx = _dec.RegIndex(mr);
+            ulong val;
+            if (mr.Mod == 3)
+            {
+                int rm = mr.Rm | (_dec.RexBase != 0 ? 8 : 0);
+                val = Mask(Reg(rm), opSizeSrc);
+            }
+            else
+            {
+                ulong addr = _dec.EffectiveAddress(mr, Reg, startRip);
+                val = ReadGuest(addr, opSizeSrc);
+            }
+            if (signExtend)
+            {
+                long sv = opSizeSrc == 1 ? (sbyte)val : (short)val;
+                val = (ulong)sv;
+            }
+            else val = Mask(val, opSizeSrc);
+            SetReg(regIdx, val);
+            Regs.Rip = startRip + (ulong)_dec.Pc;
+        }
+
+        // ---- SSE / SIMD operations (research subset, operates on XMM state) ----
+        private void SseOp(byte op, ulong startRip)
+        {
+            var mr = _dec.ReadModRm();
+            int regIdx = _dec.RegIndex(mr);
+            bool toMem = (op & 1) == 1; // odd opcodes are typically store forms
+
+            // For our research subset we treat most as 128-bit moves/logic and
+            // float arithmetic on the low lanes. Prefixes (0x66/0xF2/0xF3) select
+            // packed-double / scalar forms but we approximate uniformly.
+            switch (op)
+            {
+                case 0x10: case 0x11: // MOVUPS / MOVSS (load/store)
+                case 0x28: case 0x29: // MOVAPS / MOVAPD
+                case 0x12: case 0x13: // MOVLPS
+                case 0x16: case 0x17: // MOVHPS
+                    {
+                        // Source is reg for store (toMem), r/m for load.
+                        ulong lo, hi;
+                        if (toMem)
+                        {
+                            lo = _ext.XmmLo(regIdx); hi = _ext.XmmHi(regIdx);
+                        }
+                        else if (mr.Mod == 3)
+                        {
+                            int rm = mr.Rm | (_dec.RexBase != 0 ? 8 : 0);
+                            lo = _ext.XmmLo(rm); hi = _ext.XmmHi(rm);
+                        }
+                        else
+                        {
+                            ulong addr = _dec.EffectiveAddress(mr, Reg, startRip);
+                            _ext.ReadXmm(addr, out lo, out hi);
+                        }
+                        if (toMem)
+                        {
+                            if (mr.Mod == 3) { int rm = mr.Rm | (_dec.RexBase != 0 ? 8 : 0); _ext.SetXmm(rm, lo, hi); }
+                            else { ulong addr = _dec.EffectiveAddress(mr, Reg, startRip); _ext.WriteXmm(addr, lo, hi); }
+                        }
+                        else { _ext.SetXmm(regIdx, lo, hi); }
+                    }
+                    break;
+                case 0x6E: // MOVD / MOVQ from r/m32/64 to XMM
+                    {
+                        ulong v;
+                        if (mr.Mod == 3) v = Mask(Reg(mr.Rm | (_dec.RexBase != 0 ? 8 : 0)), _dec.RexW ? 8 : 4);
+                        else v = ReadGuest(_dec.EffectiveAddress(mr, Reg, startRip), _dec.RexW ? 8 : 4);
+                        _ext.SetXmm(regIdx, v, 0);
+                    }
+                    break;
+                case 0x7E: // MOVD / MOVQ from XMM to r/m32/64
+                    {
+                        ulong v = _ext.XmmLo(regIdx);
+                        if (mr.Mod == 3) SetReg(mr.Rm | (_dec.RexBase != 0 ? 8 : 0), Mask(v, _dec.RexW ? 8 : 4));
+                        else WriteGuest(_dec.EffectiveAddress(mr, Reg, startRip), Mask(v, _dec.RexW ? 8 : 4), _dec.RexW ? 8 : 4);
+                    }
+                    break;
+                case 0xEF: // PXOR xmm, xmm
+                case 0x57: // XORPS / XORPD
+                    {
+                        ulong lo2, hi2;
+                        if (mr.Mod == 3) { int rm = mr.Rm | (_dec.RexBase != 0 ? 8 : 0); lo2 = _ext.XmmLo(rm); hi2 = _ext.XmmHi(rm); }
+                        else { ulong a = _dec.EffectiveAddress(mr, Reg, startRip); _ext.ReadXmm(a, out lo2, out hi2); }
+                        _ext.SetXmm(regIdx, _ext.XmmLo(regIdx) ^ lo2, _ext.XmmHi(regIdx) ^ hi2);
+                    }
+                    break;
+                case 0x54: case 0x55: case 0x56: // ANDPS / ANDNPS / ORPS
+                    {
+                        ulong lo2, hi2;
+                        if (mr.Mod == 3) { int rm = mr.Rm | (_dec.RexBase != 0 ? 8 : 0); lo2 = _ext.XmmLo(rm); hi2 = _ext.XmmHi(rm); }
+                        else { ulong a = _dec.EffectiveAddress(mr, Reg, startRip); _ext.ReadXmm(a, out lo2, out hi2); }
+                        if (op == 0x54) _ext.SetXmm(regIdx, _ext.XmmLo(regIdx) & lo2, _ext.XmmHi(regIdx) & hi2);
+                        else if (op == 0x56) _ext.SetXmm(regIdx, _ext.XmmLo(regIdx) | lo2, _ext.XmmHi(regIdx) | hi2);
+                        else { ulong nl = (~_ext.XmmLo(regIdx)) & lo2; ulong nh = (~_ext.XmmHi(regIdx)) & hi2; _ext.SetXmm(regIdx, nl, nh); }
+                    }
+                    break;
+                case 0x58: case 0x59: case 0x5C: case 0x5E: // ADDPS / MULPS / SUBPS / DIVPS (low float lanes)
+                    {
+                        double a = BitConverter.Int64BitsToDouble((long)_ext.XmmLo(regIdx));
+                        double b;
+                        if (mr.Mod == 3) b = BitConverter.Int64BitsToDouble((long)_ext.XmmLo(mr.Rm | (_dec.RexBase != 0 ? 8 : 0)));
+                        else b = BitConverter.Int64BitsToDouble((long)ReadGuest(_dec.EffectiveAddress(mr, Reg, startRip), 8));
+                        double r = op switch { 0x58 => a + b, 0x59 => a * b, 0x5C => a - b, _ => a / b };
+                        _ext.SetXmm(regIdx, (ulong)BitConverter.DoubleToInt64Bits(r), _ext.XmmHi(regIdx));
+                    }
+                    break;
+                case 0x2E: case 0x2F: // UCOMISS / COMISS (compare, set flags)
+                    {
+                        float a = BitConverter.Int32BitsToSingle((int)_ext.XmmLo(regIdx));
+                        float b = mr.Mod == 3
+                            ? BitConverter.Int32BitsToSingle((int)_ext.XmmLo(mr.Rm | (_dec.RexBase != 0 ? 8 : 0)))
+                            : BitConverter.ToSingle(BitConverter.GetBytes((uint)ReadGuest(_dec.EffectiveAddress(mr, Reg, startRip), 4)), 0);
+                        Regs.SetZfSf(a == b ? 1UL : 0, 8);
+                        Regs.SetCf(a < b || float.IsNaN(a) || float.IsNaN(b));
+                        Regs.SetOf(false);
+                    }
+                    break;
+                case 0x2A: case 0x2C: // CVTPI2PS / CVTTPS2PI (approx: move low bits)
+                    {
+                        if (mr.Mod == 3) _ext.SetXmm(regIdx, _ext.XmmLo(mr.Rm | (_dec.RexBase != 0 ? 8 : 0)), _ext.XmmHi(mr.Rm | (_dec.RexBase != 0 ? 8 : 0)));
+                        else { ulong a = _dec.EffectiveAddress(mr, Reg, startRip); _ext.ReadXmm(a, out ulong lo, out ulong hi); _ext.SetXmm(regIdx, lo, hi); }
+                    }
+                    break;
+                default:
+                    // Unknown SSE op: try to decode length and skip gracefully.
+                    if (!TrySkipUnknown(startRip, 0x0F, "sse"))
+                        throw new CpuFault($"unsupported SSE opcode 0x{op:X2}");
+                    return;
             }
             Regs.Rip = startRip + (ulong)_dec.Pc;
         }

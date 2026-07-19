@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using Prospero.Emu.Core;
+using Prospero.Emu.Kernel;
 
 namespace Prospero.Emu.Format
 {
@@ -26,8 +27,20 @@ namespace Prospero.Emu.Format
             public string? ResolvedName;
         }
 
+        /// <summary>
+        /// A PLT/GOT relocation: the guest GOT slot at <see cref="GotVa"/> should
+        /// be patched to point at the trampoline for <see cref="Nid"/>.
+        /// </summary>
+        public sealed class ImportRelocation
+        {
+            public ulong GotVa;
+            public ulong Nid;
+            public string? Name;
+        }
+
         public List<string> ImportedLibraries { get; } = new();
         public List<Import> Imports { get; } = new();
+        public List<ImportRelocation> Relocations { get; } = new();
 
         public void Parse(LoadedExecutable exe)
         {
@@ -51,6 +64,7 @@ namespace Prospero.Emu.Format
             // DT entries are d_tag(8) d_val/un(8). Stop at DT_NULL (0).
             int off = 0;
             ulong strTabOff = 0, symTabOff = 0, symEnt = 0, strSz = 0, symSz = 0;
+            ulong jmpRel = 0, pltRelSz = 0, relaOff = 0;
             var needed = new List<ulong>();
             var importLibs = new List<ulong>();
 
@@ -68,6 +82,9 @@ namespace Prospero.Emu.Format
                     case 0x61000003: symTabOff = val; break;          // DT_SCE_SYMTAB
                     case 0x61000004: symSz = val; break;              // DT_SCE_SYMTABSZ
                     case 0x61000005: symEnt = val; break;             // DT_SCE_SYMENT
+                    case 0x61000014: jmpRel = val; break;            // DT_SCE_JMPREL
+                    case 0x61000015: pltRelSz = val; break;          // DT_SCE_PLTRELSZ
+                    case 0x61000017: relaOff = val; break;           // DT_SCE_RELA
                     case 0x1: needed.Add(val); break;                 // DT_NEEDED
                     case 0x61000011: importLibs.Add(val); break;      // DT_SCE_IMPORT_LIB
                 }
@@ -105,6 +122,36 @@ namespace Prospero.Emu.Format
 
             _log.Info("dynlib", $"Imported libraries ({ImportedLibraries.Count}): {string.Join(", ", ImportedLibraries)}");
             _log.Info("dynlib", $"Imported function NIDs: {Imports.Count}");
+
+            // Walk JUMP_SLOT relocations (R_X86_64_JUMP_SLOT = 0x7) so we can
+            // patch the GOT to point at synthetic libkernel trampolines.
+            // Rela entry layout: r_offset(8) r_info(8) r_addend(8). RelaEnt=0x18.
+            ulong relBase = jmpRel != 0 ? jmpRel : relaOff;
+            ulong relSize = jmpRel != 0 ? pltRelSz : 0;
+            if (relBase != 0)
+            {
+                ulong count = relSize != 0 ? relSize / 0x18 : 0;
+                for (ulong i = 0; i < count; i++)
+                {
+                    int re = (int)(relBase + i * 0x18);
+                    ulong rOffset = r.ReadU64(re);
+                    ulong rInfo = r.ReadU64(re + 8);
+                    uint relType = (uint)(rInfo & 0xFFFFFFFF);
+                    uint symIdx = (uint)(rInfo >> 32);
+                    if (relType != 0x7) continue; // JUMP_SLOT only
+                    // symbol entry: name_off(4) info(1) other(1) shndx(2) nid(8)
+                    int symOff = (int)(symTabOff + (ulong)symIdx * symEnt);
+                    ulong nid = symTabOff != 0 ? r.ReadU64(symOff + 8) : 0;
+                    if (nid == 0) continue;
+                    Relocations.Add(new ImportRelocation
+                    {
+                        GotVa = rOffset,
+                        Nid = nid,
+                        Name = KnownNids.Resolve(nid)
+                    });
+                }
+                _log.Info("dynlib", $"JUMP_SLOT relocations (GOT->NID): {Relocations.Count}");
+            }
             if (_log.MinLevel <= Logger.LogLevel.Debug)
                 for (int i = 0; i < Math.Min(Imports.Count, 40); i++)
                     _log.Debug("dynlib", $"  NID 0x{Imports[i].Nid:X8}");

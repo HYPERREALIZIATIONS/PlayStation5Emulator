@@ -17,6 +17,7 @@ namespace Prospero.Emu
     public sealed class Emulator
     {
         private readonly Logger _log;
+        private GuestMemory _mem = null!;
         public Emulator(Logger log) => _log = log;
 
         public int Run(string exePath, string? gameRoot, string? logPath)
@@ -26,6 +27,7 @@ namespace Prospero.Emu
             _log.Info("emu", "legally-obtained, already-decrypted ELF/fself files. No keys/DRM.");
 
             var mem = new GuestMemory();
+            _mem = mem;
             var loader = new SelfLoader(_log);
             LoadedExecutable exe;
             try
@@ -67,6 +69,8 @@ namespace Prospero.Emu
             // System modules: parse the dynlib imports (the modules the game needs).
             var dyn = new DynlibParser(_log);
             dyn.Parse(exe);
+            ulong moduleBase = isDynamic ? LoadBase : 0;
+            PatchImports(dyn, moduleBase);
             LoadSystemModules(dyn.ImportedLibraries);
 
             // Graphics.
@@ -95,6 +99,51 @@ namespace Prospero.Emu
             vk.Shutdown();
             return cpu.ExitCode == 0 ? 0 : 1;
         }
+
+        /// <summary>
+        /// Patches the GOT so that imported libkernel calls (resolved via
+        /// R_X86_64_JUMP_SLOT relocations) jump to a synthetic trampoline that
+        /// does `mov rax, nid; syscall; ret`. The kernel then recognises the NID
+        /// and routes it to the appropriate stub. This is how a homebrew/ELF that
+        /// links libkernel can actually run under the research kernel.
+        /// </summary>
+        private void PatchImports(DynlibParser dyn, ulong moduleBase)
+        {
+            if (dyn.Relocations.Count == 0) return;
+            _log.Info("emu", $"Patching {dyn.Relocations.Count} imported-call GOT slots...");
+
+            // Allocate one trampoline page and place a 16-byte trampoline per NID.
+            ulong page = _scratch;
+            _scratch += 0x1000;
+            _mem.Commit(page, 0x1000);
+
+            var seen = new Dictionary<ulong, ulong>();
+            int off = 0;
+            foreach (var rel in dyn.Relocations)
+            {
+                if (!seen.TryGetValue(rel.Nid, out ulong tramp))
+                {
+                    tramp = page + (ulong)off;
+                    // 48 B8 <nid:8> 0F 05 C3  => mov rax, imm64(nid); syscall; ret  (16 bytes)
+                    var code = new byte[]
+                    {
+                        0x48, 0xB8,
+                        (byte)(rel.Nid & 0xFF), (byte)((rel.Nid >> 8) & 0xFF),
+                        (byte)((rel.Nid >> 16) & 0xFF), (byte)((rel.Nid >> 24) & 0xFF),
+                        0, 0, 0, 0,            // high 32 bits zero
+                        0x0F, 0x05, 0xC3, 0, 0, 0
+                    };
+                    _mem.Write(tramp, code);
+                    off += 16;
+                    seen[rel.Nid] = tramp;
+                    _log.Debug("emu", $"  trampoline for NID 0x{rel.Nid & 0xFFFFFFFF:X8} ({rel.Name}) @ 0x{tramp:X}");
+                }
+                ulong gotVa = moduleBase + rel.GotVa;
+                _mem.WriteU64(gotVa, tramp);
+            }
+        }
+
+        private ulong _scratch = 0x7800_0000_0000;
 
         private void LoadSystemModules(List<string> libs)
         {
