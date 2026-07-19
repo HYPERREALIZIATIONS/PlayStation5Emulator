@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <RootNamespace>SharpEmu</RootNamespace>
+    <AssemblyName>SharpEmu</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Version>0.1.0-research</Version>
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\SharpEmu.Core\SharpEmu.Core.csproj" />
+    <ProjectReference Include="..\SharpEmu.Libs\SharpEmu.Libs.csproj" />
+    <ProjectReference Include="..\SharpEmu.Graphics\SharpEmu.Graphics.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <RootNamespace>SharpEmu.Graphics</RootNamespace>
+    <AssemblyName>SharpEmu.Graphics</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\SharpEmu.Core\SharpEmu.Core.csproj" />
+    <ProjectReference Include="..\SharpEmu.Libs\SharpEmu.Libs.csproj" />
+  </ItemGroup>
+
+</Project>
