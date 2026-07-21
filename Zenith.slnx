@@ -1,0 +1,14 @@
+<Project>
+
+  <PropertyGroup>
+    <SolutionName>Zenith</SolutionName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="src\Core\Core.csproj" />
+    <ProjectReference Include="src\Gnm\Gnm.csproj" />
+    <ProjectReference Include="src\Host\Host.csproj" />
+    <ProjectReference Include="tests\Tests.csproj" />
+  </ItemGroup>
+
+</Project>
