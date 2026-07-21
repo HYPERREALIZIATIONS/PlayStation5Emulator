@@ -1,0 +1,121 @@
+name: Zenith CI and Beta Release
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore
+        run: dotnet restore Zenith.slnx
+
+      - name: Build
+        run: dotnet build Zenith.slnx --no-restore -c Release
+
+      - name: Test
+        run: dotnet test tests/Tests.csproj --no-build -v n --logger "console;verbosity=detailed"
+
+      - name: Publish Windows x64
+        if: matrix.os == 'windows-latest'
+        run: dotnet publish src/Host/Host.csproj -c Release -r win-x64 --self-contained true -o ./publish/win-x64
+
+      - name: Publish Linux x64
+        if: matrix.os == 'ubuntu-latest'
+        run: dotnet publish src/Host/Host.csproj -c Release -r linux-x64 --self-contained true -o ./publish/linux-x64
+
+      - name: Publish macOS x64
+        if: matrix.os == 'macos-latest'
+        run: dotnet publish src/Host/Host.csproj -c Release -r osx-x64 --self-contained true -o ./publish/osx-x64
+
+      - name: Upload Windows artifact
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zenith-win-x64-beta
+          path: publish/win-x64/**
+
+      - name: Upload Linux artifact
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zenith-linux-x64-beta
+          path: publish/linux-x64/**
+
+      - name: Upload macOS artifact
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zenith-osx-x64-beta
+          path: publish/osx-x64/**
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Zenith-win-x64-beta
+          path: release/win-x64
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Zenith-linux-x64-beta
+          path: release/linux-x64
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Zenith-osx-x64-beta
+          path: release/osx-x64
+
+      - name: Package Windows
+        run: |
+          cd release/win-x64
+          7z a ../../Zenith-win-x64-beta.zip .
+
+      - name: Package Linux
+        run: |
+          cd release/linux-x64
+          tar czf ../../Zenith-linux-x64-beta.tar.gz .
+
+      - name: Package macOS
+        run: |
+          cd release/osx-x64
+          tar czf ../../Zenith-osx-x64-beta.tar.gz .
+
+      - name: Create Beta Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: beta-latest
+          name: Zenith Beta (Unstable Preview)
+          body: |
+            This is an early beta build. Expect crashes, missing features, and broken compatibility.
+            For research and educational use only. Requires a legally obtained game dump.
+          draft: false
+          prerelease: true
+          files: |
+            Zenith-win-x64-beta.zip
+            Zenith-linux-x64-beta.tar.gz
+            Zenith-osx-x64-beta.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
